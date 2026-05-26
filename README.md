@@ -18,7 +18,7 @@ device capability mapping.
 1. **`device-connector.yaml`** — identity and runtime spec (image, port, MQTT prefix)
 2. **`handler.go`** — implement `sdk.Handler` with your device's capability mapping
 
-See `examples/device-connectors/xiaomi-plug/` for a complete example.
+See connector repositories such as `thingspanel-device-connector-snmp`, `thingspanel-device-connector-homeassistant`, and `thingspanel-device-connector-xiaomi` for end-to-end examples.
 
 ## Handler interface
 
