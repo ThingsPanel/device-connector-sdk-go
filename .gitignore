@@ -1,0 +1,4 @@
+*.test
+*.out
+.coverprofile
+.DS_Store
