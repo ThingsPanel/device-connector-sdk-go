@@ -30,6 +30,7 @@ type FormConfigRequest struct {
 // DeviceAddRequest is sent by ThingsPanel when a device is bound to this connector.
 type DeviceAddRequest struct {
 	DeviceID     string         `json:"device_id"`
+	DeviceNumber string         `json:"device_number,omitempty"`
 	DeviceConfig map[string]any `json:"device_config"`
 	// AccessToken is the device's MQTT credential if applicable.
 	AccessToken string `json:"access_token,omitempty"`
@@ -113,6 +114,9 @@ type ConnectorInfo struct {
 	BackendURL string
 	// HeartbeatInterval is how often to POST /api/v1/plugin/heartbeat.
 	HeartbeatInterval time.Duration
+	// MQTTBroker is the MQTT broker address for publishing telemetry.
+	// Read from TP_MQTT_BROKER (preferred) or MQTT_BROKER environment variable.
+	MQTTBroker string
 }
 
 // FromEnv populates ConnectorInfo from standard environment variables.

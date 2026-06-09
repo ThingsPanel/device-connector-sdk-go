@@ -28,11 +28,17 @@ func fromEnv() ConnectorInfo {
 		listenAddr = ":9001"
 	}
 
+	mqttBroker := os.Getenv("TP_MQTT_BROKER")
+	if mqttBroker == "" {
+		mqttBroker = os.Getenv("MQTT_BROKER")
+	}
+
 	return ConnectorInfo{
 		ServiceIdentifier: os.Getenv("CONNECTOR_SERVICE_IDENTIFIER"),
 		InstanceID:        os.Getenv("CONNECTOR_INSTANCE_ID"),
 		ListenAddr:        listenAddr,
 		BackendURL:        os.Getenv("THINGSPANEL_BACKEND_URL"),
 		HeartbeatInterval: interval,
+		MQTTBroker:        mqttBroker,
 	}
 }

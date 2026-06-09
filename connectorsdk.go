@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,10 +63,11 @@ type DeviceLister interface {
 // Server wires HTTP routes and manages the heartbeat goroutine.
 // Construct with NewServer; start with Run.
 type Server struct {
-	info    ConnectorInfo
-	handler Handler
-	mux     *http.ServeMux
-	logger  *slog.Logger
+	info          ConnectorInfo
+	handler       Handler
+	mux           *http.ServeMux
+	logger        *slog.Logger
+	devicesSynced atomic.Bool
 }
 
 // NewServer creates a server with the given identity and handler.
@@ -416,7 +418,115 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 
 	if resp.StatusCode >= 300 {
 		s.logger.Warn("heartbeat: unexpected status", "status", resp.StatusCode)
+		return
 	}
+
+	// On the first successful heartbeat, re-sync bound devices so the in-memory
+	// state is recovered after a process restart (the backend only calls
+	// /api/v1/device/add once, at bind time, and never re-pushes on reconnect).
+	if s.devicesSynced.CompareAndSwap(false, true) {
+		go s.syncBoundDevices(ctx)
+	}
+}
+
+// syncBoundDevices calls the backend's service-access list endpoint and replays
+// OnDeviceAdd for every device that was already bound before this process started.
+// It runs once in a goroutine after the first successful heartbeat.
+func (s *Server) syncBoundDevices(ctx context.Context) {
+	url := s.info.BackendURL + "/api/v1/plugin/service/access/list"
+	body, _ := json.Marshal(map[string]string{
+		"service_identifier": s.info.ServiceIdentifier,
+	})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		s.logger.Error("startup sync: build request", "err", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		s.logger.Warn("startup sync: request failed", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var envelope struct {
+		Code int             `json:"code"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		s.logger.Warn("startup sync: decode response", "err", err)
+		return
+	}
+	if envelope.Code != 200 || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+		s.logger.Info("startup sync: no service access data", "code", envelope.Code)
+		return
+	}
+
+	var serviceAccesses []map[string]any
+	if err := json.Unmarshal(envelope.Data, &serviceAccesses); err != nil {
+		s.logger.Warn("startup sync: decode service accesses", "err", err)
+		return
+	}
+
+	synced := 0
+	for _, sa := range serviceAccesses {
+		svcVoucher := parseJSONObject(sa["voucher"])
+		devicesRaw, _ := sa["devices"].([]any)
+		for _, devAny := range devicesRaw {
+			dev, ok := devAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			deviceID, _ := dev["id"].(string)
+			deviceNumber, _ := dev["device_number"].(string)
+			if deviceID == "" {
+				continue
+			}
+
+			// Build device_config: service-access voucher merged with per-device
+			// protocol_config, with device fields taking precedence.
+			deviceCfg := make(map[string]any, len(svcVoucher))
+			for k, v := range svcVoucher {
+				deviceCfg[k] = v
+			}
+			for k, v := range parseJSONObject(dev["protocol_config"]) {
+				deviceCfg[k] = v
+			}
+
+			// MQTT access token lives in device.voucher["username"].
+			devVoucher := parseJSONObject(dev["voucher"])
+			accessToken, _ := devVoucher["username"].(string)
+
+			if err := s.handler.OnDeviceAdd(ctx, DeviceAddRequest{
+				DeviceID:     deviceID,
+				DeviceNumber: deviceNumber,
+				DeviceConfig: deviceCfg,
+				AccessToken:  accessToken,
+			}); err != nil {
+				s.logger.Error("startup sync: OnDeviceAdd failed", "deviceID", deviceID, "err", err)
+				continue
+			}
+			synced++
+		}
+	}
+	s.logger.Info("startup sync complete", "devicesSynced", synced)
+}
+
+// parseJSONObject parses a JSON-encoded object string into a map.
+// Returns an empty map on any error so callers never have to nil-check.
+func parseJSONObject(v any) map[string]any {
+	s, ok := v.(string)
+	if !ok || strings.TrimSpace(s) == "" {
+		return map[string]any{}
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(s), &result); err != nil {
+		return map[string]any{}
+	}
+	return result
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
