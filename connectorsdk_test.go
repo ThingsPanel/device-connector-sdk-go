@@ -20,8 +20,10 @@ type stubHandler struct {
 	configCalled     bool
 	disconnectCalled bool
 	eventCalled      bool
+	eventCalls       int
 	listCalled       bool
 	lastFormRequest  sdk.FormConfigRequest
+	lastEvent        sdk.EventNotification
 }
 
 func (h *stubHandler) FormConfig(_ context.Context) (sdk.FormConfig, error) {
@@ -114,8 +116,10 @@ func (h *stubHandler) OnDisconnect(_ context.Context, _ sdk.DisconnectRequest) e
 	h.disconnectCalled = true
 	return nil
 }
-func (h *stubHandler) OnEvent(_ context.Context, _ sdk.EventNotification) error {
+func (h *stubHandler) OnEvent(_ context.Context, event sdk.EventNotification) error {
 	h.eventCalled = true
+	h.eventCalls++
+	h.lastEvent = event
 	return nil
 }
 func (h *stubHandler) ListDevices(_ context.Context, req sdk.DeviceListRequest) (sdk.DeviceListResponse, error) {
@@ -127,6 +131,15 @@ func (h *stubHandler) ListDevices(_ context.Context, req sdk.DeviceListRequest) 
 			DeviceNumber: "lamp-001",
 		}},
 	}, nil
+}
+
+type notificationOnlyHandler struct {
+	called bool
+}
+
+func (h *notificationOnlyHandler) OnEvent(_ context.Context, _ sdk.EventNotification) error {
+	h.called = true
+	return nil
 }
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -305,28 +318,21 @@ func TestServer_PluginDeviceList(t *testing.T) {
 	}
 }
 
-func TestServer_DeviceAdd(t *testing.T) {
+func TestServer_LegacyDeviceMutationRoutesAreNotExposed(t *testing.T) {
 	srv, h := newTestServer(t)
-	body := `{"device_id":"dev-001","device_config":{}}`
-	rr := doRequest(t, srv, http.MethodPost, "/api/v1/device/add", body)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("POST /api/v1/device/add: expected 200, got %d (body: %s)", rr.Code, rr.Body)
+	paths := []string{
+		"/api/v1/device/add",
+		"/api/v1/device/delete",
+		"/api/v1/device/config/update",
 	}
-	if !h.addCalled {
-		t.Error("expected OnDeviceAdd to be called")
+	for _, path := range paths {
+		rr := doRequest(t, srv, http.MethodPost, path, `{}`)
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("POST %s: expected 404, got %d", path, rr.Code)
+		}
 	}
-}
-
-func TestServer_DeviceDelete(t *testing.T) {
-	srv, h := newTestServer(t)
-	rr := doRequest(t, srv, http.MethodPost, "/api/v1/device/delete", `{"device_id":"dev-001"}`)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("POST /api/v1/device/delete: expected 200, got %d", rr.Code)
-	}
-	if !h.deleteCalled {
-		t.Error("expected OnDeviceDelete to be called")
+	if h.addCalled || h.deleteCalled || h.configCalled {
+		t.Fatal("legacy device mutation callbacks must not be dispatched")
 	}
 }
 
@@ -362,35 +368,53 @@ func TestServer_Disconnect(t *testing.T) {
 	}
 }
 
-func TestServer_ConfigUpdate(t *testing.T) {
+func TestServer_PluginNotification(t *testing.T) {
 	srv, h := newTestServer(t)
-	body := `{"device_id":"dev-001","device_config":{"token":"abc"}}`
-	rr := doRequest(t, srv, http.MethodPost, "/api/v1/device/config/update", body)
+	body := `{"message_type":"1","message":"{\"service_access_id\":\"access-001\"}"}`
+	rr := doRequest(t, srv, http.MethodPost, sdk.PluginNotificationPath, body)
 
 	if rr.Code != http.StatusOK {
-		t.Fatalf("POST /api/v1/device/config/update: expected 200, got %d", rr.Code)
+		t.Fatalf("POST %s: expected 200, got %d", sdk.PluginNotificationPath, rr.Code)
 	}
-	if !h.configCalled {
-		t.Error("expected OnConfigUpdate to be called")
+	if h.eventCalls != 1 {
+		t.Fatalf("expected OnEvent once, got %d", h.eventCalls)
+	}
+	if h.lastEvent.EventType != "service_access.updated" || h.lastEvent.Payload["service_access_id"] != "access-001" {
+		t.Fatalf("unexpected normalized event: %#v", h.lastEvent)
 	}
 }
 
-func TestServer_Event(t *testing.T) {
+func TestServer_LegacyNotificationAlias(t *testing.T) {
 	srv, h := newTestServer(t)
 	body := `{"event_type":"test","device_id":"dev-001"}`
-	rr := doRequest(t, srv, http.MethodPost, "/api/v1/notify/event", body)
+	rr := doRequest(t, srv, http.MethodPost, sdk.LegacyNotificationPath, body)
 
 	if rr.Code != http.StatusOK {
-		t.Fatalf("POST /api/v1/notify/event: expected 200, got %d", rr.Code)
+		t.Fatalf("POST %s: expected 200, got %d", sdk.LegacyNotificationPath, rr.Code)
 	}
-	if !h.eventCalled {
-		t.Error("expected OnEvent to be called")
+	if h.eventCalls != 1 {
+		t.Fatalf("expected OnEvent once, got %d", h.eventCalls)
+	}
+}
+
+func TestServer_OptionalCapabilities(t *testing.T) {
+	handler := &notificationOnlyHandler{}
+	srv := sdk.NewServer(sdk.ConnectorInfo{}, handler)
+
+	rr := doRequest(t, srv, http.MethodPost, sdk.PluginNotificationPath, `{"event_type":"test"}`)
+	if rr.Code != http.StatusOK || !handler.called {
+		t.Fatalf("notification-only handler was not dispatched: status=%d", rr.Code)
+	}
+
+	rr = doRequest(t, srv, http.MethodGet, "/api/v1/form/config", "")
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("unsupported capability: expected 501, got %d", rr.Code)
 	}
 }
 
 func TestServer_BadJSON_Returns400(t *testing.T) {
 	srv, _ := newTestServer(t)
-	rr := doRequest(t, srv, http.MethodPost, "/api/v1/device/add", "not-json")
+	rr := doRequest(t, srv, http.MethodPost, sdk.PluginNotificationPath, "not-json")
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for bad JSON, got %d", rr.Code)

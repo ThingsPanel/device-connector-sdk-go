@@ -10,34 +10,32 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
-// Handler is implemented by the connector author.
-// Each method maps to one ThingsPanel HTTP callback route.
-// Methods may return an error; the SDK translates that to a 500 response.
-type Handler interface {
-	// FormConfig returns the JSON form schema for the connector's config UI.
+// Handler is the connector implementation passed to NewServer. Connector
+// authors implement only the capability interfaces they need. Existing
+// implementations of the former all-method Handler remain source-compatible.
+type Handler interface{}
+
+// FormConfigHandler provides the connector configuration form.
+type FormConfigHandler interface {
 	FormConfig(ctx context.Context) (FormConfig, error)
+}
 
-	// OnDeviceAdd is called when a device is first bound to this connector.
-	OnDeviceAdd(ctx context.Context, req DeviceAddRequest) error
-
-	// OnDeviceDelete is called when a device is unbound/deleted.
-	OnDeviceDelete(ctx context.Context, req DeviceDeleteRequest) error
-
-	// OnCommand is called when ThingsPanel sends a downlink command.
+// CommandHandler handles optional HTTP command callbacks.
+type CommandHandler interface {
 	OnCommand(ctx context.Context, req CommandRequest) (CommandResponse, error)
+}
 
-	// OnConfigUpdate is called when a device's configuration is updated.
-	OnConfigUpdate(ctx context.Context, req ConfigUpdateRequest) error
-
-	// OnDisconnect is called when a device goes offline.
+// DisconnectHandler handles the platform request to disconnect a device.
+type DisconnectHandler interface {
 	OnDisconnect(ctx context.Context, req DisconnectRequest) error
+}
 
-	// OnEvent is called for generic platform event notifications.
-	// Connectors that do not handle events can return nil without error.
+// NotificationHandler handles platform notifications. Service connectors use
+// these notifications to trigger their own device/config reconciliation.
+type NotificationHandler interface {
 	OnEvent(ctx context.Context, ev EventNotification) error
 }
 
@@ -63,11 +61,11 @@ type DeviceLister interface {
 // Server wires HTTP routes and manages the heartbeat goroutine.
 // Construct with NewServer; start with Run.
 type Server struct {
-	info          ConnectorInfo
-	handler       Handler
-	mux           *http.ServeMux
-	logger        *slog.Logger
-	devicesSynced atomic.Bool
+	info       ConnectorInfo
+	handler    Handler
+	mux        *http.ServeMux
+	logger     *slog.Logger
+	httpClient *http.Client
 }
 
 // NewServer creates a server with the given identity and handler.
@@ -77,6 +75,9 @@ func NewServer(info ConnectorInfo, handler Handler) *Server {
 		handler: handler,
 		mux:     http.NewServeMux(),
 		logger:  slog.Default(),
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
 	}
 	s.registerRoutes()
 	return s
@@ -132,6 +133,13 @@ func (s *Server) Run(ctx context.Context) error {
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
+const (
+	// PluginNotificationPath is the canonical ThingsPanel notification endpoint.
+	PluginNotificationPath = "/api/v1/plugin/notification"
+	// LegacyNotificationPath remains as a receive-only compatibility alias.
+	LegacyNotificationPath = "/api/v1/notify/event"
+)
+
 func (s *Server) registerRoutes() {
 	// Health — checked by K8S readiness/liveness probe.
 	s.mux.HandleFunc("GET /health", s.handleHealth)
@@ -139,18 +147,16 @@ func (s *Server) registerRoutes() {
 	// ThingsPanel HTTP callback routes (from backend-integration-contract.md).
 	s.mux.HandleFunc("GET /api/v1/form/config", s.handleFormConfig)
 	s.mux.HandleFunc("GET /api/v1/plugin/device/list", s.handlePluginDeviceList)
-	s.mux.HandleFunc("POST /api/v1/device/add", s.handleDeviceAdd)
-	s.mux.HandleFunc("POST /api/v1/device/delete", s.handleDeviceDelete)
 	s.mux.HandleFunc("POST /api/v1/device/command", s.handleCommand)
-	s.mux.HandleFunc("POST /api/v1/device/config/update", s.handleConfigUpdate)
 	s.mux.HandleFunc("POST /api/v1/device/disconnect", s.handleDisconnect)
-	s.mux.HandleFunc("POST /api/v1/notify/event", s.handleEvent)
+	s.mux.HandleFunc("POST "+PluginNotificationPath, s.handleEvent)
+	s.mux.HandleFunc("POST "+LegacyNotificationPath, s.handleEvent)
 }
 
 func (s *Server) handlePluginDeviceList(w http.ResponseWriter, r *http.Request) {
 	lister, ok := s.handler.(DeviceLister)
 	if !ok {
-		writeJSON(w, http.StatusOK, legacyEnvelope(DeviceListResponse{List: []DiscoveredDevice{}}))
+		writeUnsupported(w, "device listing")
 		return
 	}
 	page := parsePositiveInt(r.URL.Query().Get("page"), 1)
@@ -221,7 +227,12 @@ func (s *Server) handleFormConfig(w http.ResponseWriter, r *http.Request) {
 	if provider, ok := s.handler.(FormConfigProvider); ok {
 		cfg, err = provider.FormConfigFor(r.Context(), req)
 	} else {
-		cfg, err = s.handler.FormConfig(r.Context())
+		provider, ok := s.handler.(FormConfigHandler)
+		if !ok {
+			writeUnsupported(w, "form config")
+			return
+		}
+		cfg, err = provider.FormConfig(r.Context())
 	}
 	if err != nil {
 		s.logger.Error("FormConfig error", "err", err)
@@ -239,38 +250,17 @@ func (s *Server) handleFormConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cfg)
 }
 
-func (s *Server) handleDeviceAdd(w http.ResponseWriter, r *http.Request) {
-	var req DeviceAddRequest
-	if !decodeBody(w, r, &req) {
-		return
-	}
-	if err := s.handler.OnDeviceAdd(r.Context(), req); err != nil {
-		s.logger.Error("OnDeviceAdd error", "deviceID", req.DeviceID, "err", err)
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
-	var req DeviceDeleteRequest
-	if !decodeBody(w, r, &req) {
-		return
-	}
-	if err := s.handler.OnDeviceDelete(r.Context(), req); err != nil {
-		s.logger.Error("OnDeviceDelete error", "deviceID", req.DeviceID, "err", err)
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
 func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
+	handler, ok := s.handler.(CommandHandler)
+	if !ok {
+		writeUnsupported(w, "device command")
+		return
+	}
 	var req CommandRequest
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	resp, err := s.handler.OnCommand(r.Context(), req)
+	resp, err := handler.OnCommand(r.Context(), req)
 	if err != nil {
 		s.logger.Error("OnCommand error", "deviceID", req.DeviceID, "err", err)
 		writeError(w, http.StatusInternalServerError, err)
@@ -279,25 +269,17 @@ func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
-	var req ConfigUpdateRequest
-	if !decodeBody(w, r, &req) {
-		return
-	}
-	if err := s.handler.OnConfigUpdate(r.Context(), req); err != nil {
-		s.logger.Error("OnConfigUpdate error", "deviceID", req.DeviceID, "err", err)
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
 func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	handler, ok := s.handler.(DisconnectHandler)
+	if !ok {
+		writeUnsupported(w, "device disconnect")
+		return
+	}
 	var req DisconnectRequest
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if err := s.handler.OnDisconnect(r.Context(), req); err != nil {
+	if err := handler.OnDisconnect(r.Context(), req); err != nil {
 		s.logger.Error("OnDisconnect error", "deviceID", req.DeviceID, "err", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -306,12 +288,17 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
+	handler, ok := s.handler.(NotificationHandler)
+	if !ok {
+		writeUnsupported(w, "plugin notification")
+		return
+	}
 	var raw map[string]any
 	if !decodeBody(w, r, &raw) {
 		return
 	}
 	ev := normalizeEventNotification(raw)
-	if err := s.handler.OnEvent(r.Context(), ev); err != nil {
+	if err := handler.OnEvent(r.Context(), ev); err != nil {
 		s.logger.Error("OnEvent error", "eventType", ev.EventType, "err", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -409,7 +396,7 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		s.logger.Warn("heartbeat: POST failed", "url", url, "err", err)
 		return
@@ -418,115 +405,7 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 
 	if resp.StatusCode >= 300 {
 		s.logger.Warn("heartbeat: unexpected status", "status", resp.StatusCode)
-		return
 	}
-
-	// On the first successful heartbeat, re-sync bound devices so the in-memory
-	// state is recovered after a process restart (the backend only calls
-	// /api/v1/device/add once, at bind time, and never re-pushes on reconnect).
-	if s.devicesSynced.CompareAndSwap(false, true) {
-		go s.syncBoundDevices(ctx)
-	}
-}
-
-// syncBoundDevices calls the backend's service-access list endpoint and replays
-// OnDeviceAdd for every device that was already bound before this process started.
-// It runs once in a goroutine after the first successful heartbeat.
-func (s *Server) syncBoundDevices(ctx context.Context) {
-	url := s.info.BackendURL + "/api/v1/plugin/service/access/list"
-	body, _ := json.Marshal(map[string]string{
-		"service_identifier": s.info.ServiceIdentifier,
-	})
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		s.logger.Error("startup sync: build request", "err", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		s.logger.Warn("startup sync: request failed", "err", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	var envelope struct {
-		Code int             `json:"code"`
-		Data json.RawMessage `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		s.logger.Warn("startup sync: decode response", "err", err)
-		return
-	}
-	if envelope.Code != 200 || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
-		s.logger.Info("startup sync: no service access data", "code", envelope.Code)
-		return
-	}
-
-	var serviceAccesses []map[string]any
-	if err := json.Unmarshal(envelope.Data, &serviceAccesses); err != nil {
-		s.logger.Warn("startup sync: decode service accesses", "err", err)
-		return
-	}
-
-	synced := 0
-	for _, sa := range serviceAccesses {
-		svcVoucher := parseJSONObject(sa["voucher"])
-		devicesRaw, _ := sa["devices"].([]any)
-		for _, devAny := range devicesRaw {
-			dev, ok := devAny.(map[string]any)
-			if !ok {
-				continue
-			}
-			deviceID, _ := dev["id"].(string)
-			deviceNumber, _ := dev["device_number"].(string)
-			if deviceID == "" {
-				continue
-			}
-
-			// Build device_config: service-access voucher merged with per-device
-			// protocol_config, with device fields taking precedence.
-			deviceCfg := make(map[string]any, len(svcVoucher))
-			for k, v := range svcVoucher {
-				deviceCfg[k] = v
-			}
-			for k, v := range parseJSONObject(dev["protocol_config"]) {
-				deviceCfg[k] = v
-			}
-
-			// MQTT access token lives in device.voucher["username"].
-			devVoucher := parseJSONObject(dev["voucher"])
-			accessToken, _ := devVoucher["username"].(string)
-
-			if err := s.handler.OnDeviceAdd(ctx, DeviceAddRequest{
-				DeviceID:     deviceID,
-				DeviceNumber: deviceNumber,
-				DeviceConfig: deviceCfg,
-				AccessToken:  accessToken,
-			}); err != nil {
-				s.logger.Error("startup sync: OnDeviceAdd failed", "deviceID", deviceID, "err", err)
-				continue
-			}
-			synced++
-		}
-	}
-	s.logger.Info("startup sync complete", "devicesSynced", synced)
-}
-
-// parseJSONObject parses a JSON-encoded object string into a map.
-// Returns an empty map on any error so callers never have to nil-check.
-func parseJSONObject(v any) map[string]any {
-	s, ok := v.(string)
-	if !ok || strings.TrimSpace(s) == "" {
-		return map[string]any{}
-	}
-	var result map[string]any
-	if err := json.Unmarshal([]byte(s), &result); err != nil {
-		return map[string]any{}
-	}
-	return result
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -539,6 +418,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+func writeUnsupported(w http.ResponseWriter, capability string) {
+	writeJSON(w, http.StatusNotImplemented, map[string]string{
+		"error": capability + " is not supported by this connector",
+	})
 }
 
 func legacyEnvelope(data any) map[string]any {
